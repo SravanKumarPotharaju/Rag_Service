@@ -1,374 +1,382 @@
 """
-Simple RAG API with Gemini and Pinecone
-FastAPI application with file upload and query endpoints
+AgriGPT RAG Service  v3.0
+Single Pinecone index, metadata-filtered retrieval, Gemini tool calling.
 """
 
-from fastapi import FastAPI, File, UploadFile, HTTPException
+from fastapi import FastAPI, File, Form, UploadFile, HTTPException
 from pydantic import BaseModel
 from typing import List, Dict
-import os
+import os, io, time
+
 from pinecone import Pinecone, ServerlessSpec
 import google.genai as genai
 from google.genai import types
 from PyPDF2 import PdfReader
 import docx
-import io
 from dotenv import load_dotenv
-#from sentence_transformers import SentenceTransformer   # change 1
+from tenacity import retry, stop_after_attempt, wait_exponential
 
-# Load environment variables from .env file
 load_dotenv()
 
-# Initialize FastAPI
-app = FastAPI(
-    title="RAG API with Gemini",
-    description="Upload documents and query them using Gemini AI",
-    version="1.0.0"
-)
+# ── Config ─────────────────────────────────────────────────────────────────────
 
-# Configuration
 PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-INDEX_NAME = "gemini-rag"
-CHUNK_SIZE = 1000                   # hyper parameter 1
-CHUNK_OVERLAP = 200                 # hyper parameter 2
+GEMINI_API_KEY   = os.getenv("GEMINI_API_KEY")
 
 if not PINECONE_API_KEY:
-    raise ValueError("PINECONE_API_KEY environment variable not set")
+    raise ValueError("PINECONE_API_KEY not set")
 if not GEMINI_API_KEY:
-    raise ValueError("GEMINI_API_KEY environment variable not set")
+    raise ValueError("GEMINI_API_KEY not set")
 
-print(f"Pinecone API Key loaded: {PINECONE_API_KEY[:10]}...")
-print(f"Gemini API Key loaded: {GEMINI_API_KEY[:10]}...")
+INDEX_NAME    = "agriculture-knowledge-base"
+ALLOWED_TYPES = {"pests", "schemes"}
 
-# Initialize Pinecone
-pc = Pinecone(api_key=PINECONE_API_KEY)
+CHUNK_SIZE    = 1000
+CHUNK_OVERLAP = 200
+EMBED_DIM     = 768
+EMBED_MODEL   = "models/gemini-embedding-001"
+LLM_MODEL     = "gemini-2.5-flash"
+EMBED_BATCH   = 20
+UPSERT_BATCH  = 100
 
-# Initialize Gemini client
-client = genai.Client(api_key=GEMINI_API_KEY)
+# ── Clients ────────────────────────────────────────────────────────────────────
 
-# Initialize embedding model
-#embedding_model = SentenceTransformer('all-MiniLM-L6-v2')     # change2   # hyperparameter3
-embedding_model = 'models/gemini-embedding-001'
-# Create or connect to index
-def setup_index():
-    """Setup Pinecone index"""
-    try:
-        existing_indexes = [idx['name'] for idx in pc.list_indexes()]
-        print(f"Existing indexes: {existing_indexes}")
-    except Exception as e:
-        print(f"Error listing indexes: {e}")
-        raise
-    
-    if INDEX_NAME not in existing_indexes:
-        print(f"Creating new index: {INDEX_NAME}")
+pc     = Pinecone(api_key=PINECONE_API_KEY)
+gemini = genai.Client(api_key=GEMINI_API_KEY)
+
+app = FastAPI(
+    title="AgriGPT RAG Service",
+    description="Single-index RAG with metadata filtering and Gemini tool calling",
+    version="3.0.0",
+)
+
+# ── Pinecone setup ─────────────────────────────────────────────────────────────
+
+def _init_index():
+    existing = {idx["name"] for idx in pc.list_indexes()}
+    if INDEX_NAME not in existing:
+        print(f"Creating Pinecone index: {INDEX_NAME}")
         pc.create_index(
             name=INDEX_NAME,
-            dimension=768,  # must match EMBED_OUTPUT_DIM (Gemini with output_dimensionality=768)
-            metric='cosine',                                   # hyperparameter 5
-            spec=ServerlessSpec(cloud='aws', region='us-east-1')
+            dimension=EMBED_DIM,
+            metric="cosine",
+            spec=ServerlessSpec(cloud="aws", region="us-east-1"),
         )
     else:
-        print(f"Using existing index: {INDEX_NAME}")
-    
+        print(f"Connected to existing index: {INDEX_NAME}")
     return pc.Index(INDEX_NAME)
 
-index = setup_index()
+index = _init_index()
 
-# Pydantic models
+# ── Pydantic models ────────────────────────────────────────────────────────────
+
 class QueryRequest(BaseModel):
     question: str
-    top_k: int = 3                                    # hyper parameter 6
+    top_k: int = 5
+
+class SourceChunk(BaseModel):
+    chunk_id: str
+    filename: str
+    type: str
+    score: float
+    text: str
 
 class QueryResponse(BaseModel):
     answer: str
-    sources: List[Dict]
+    sources: List[SourceChunk]
+    tools_used: List[str]
 
 class UploadResponse(BaseModel):
     message: str
     filename: str
+    type: str
     chunks_added: int
 
-# Helper functions
-def extract_text_from_file(file: UploadFile) -> str:
-    """Extract text from different file types"""
-    content = file.file.read()
-    
-    if file.filename.endswith('.txt'):
-        return content.decode('utf-8')
-    
-    elif file.filename.endswith('.pdf'):
-        pdf_reader = PdfReader(io.BytesIO(content))
-        text = ""
-        for page in pdf_reader.pages:
-            text += page.extract_text() + "\n"
-        return text
-    
-    elif file.filename.endswith('.docx'):
-        doc = docx.Document(io.BytesIO(content))
-        text = ""
-        for para in doc.paragraphs:
-            text += para.text + "\n"
-        return text
-    
-    else:
-        raise HTTPException(status_code=400, detail="Unsupported file type. Use .txt, .pdf, or .docx")
+# ── Text extraction ────────────────────────────────────────────────────────────
 
-def chunk_text(text: str) -> List[str]:                     # chunking function for simple chunking
-    """Split text into chunks"""
-    chunks = []
-    start = 0
-    
+def _extract_text(file: UploadFile) -> str:
+    data = file.file.read()
+    if file.filename.endswith(".txt"):
+        return data.decode("utf-8")
+    if file.filename.endswith(".pdf"):
+        reader = PdfReader(io.BytesIO(data))
+        return "\n".join(page.extract_text() or "" for page in reader.pages)
+    if file.filename.endswith(".docx"):
+        doc = docx.Document(io.BytesIO(data))
+        return "\n".join(p.text for p in doc.paragraphs)
+    raise HTTPException(400, "Unsupported file type. Use .pdf, .txt or .docx")
+
+def _chunk(text: str) -> List[str]:
+    chunks, start = [], 0
     while start < len(text):
-        end = start + CHUNK_SIZE
-        chunk = text[start:end]
-        if chunk.strip():  # Only add non-empty chunks
+        chunk = text[start : start + CHUNK_SIZE]
+        if chunk.strip():
             chunks.append(chunk)
-        start = end - CHUNK_OVERLAP
-    
+        start += CHUNK_SIZE - CHUNK_OVERLAP
     return chunks
 
-# code for sentence transformer
-# def get_embedding(text: str) -> List[float]:  
-#     """Generate embedding using Sentence Transformers"""
-#     try:
-#         embedding = embedding_model.encode(text)
-#         return embedding.tolist()
-#     except Exception as e:
-#         print(f"Error generating embedding: {e}")
-#         raise
+# ── Embeddings ─────────────────────────────────────────────────────────────────
 
-# def get_query_embedding(text: str) -> List[float]:  
-#     """Generate embedding for query using Sentence Transformers"""
-#     try:
-#         embedding = embedding_model.encode(text)
-#         return embedding.tolist()
-#     except Exception as e:
-#         print(f"Error generating query embedding: {e}")
-#         raise
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(min=1, max=10))
+def _embed_batch(texts: List[str]) -> List[List[float]]:
+    res = gemini.models.embed_content(
+        model=EMBED_MODEL,
+        contents=texts,
+        config=types.EmbedContentConfig(output_dimensionality=EMBED_DIM),
+    )
+    return [e.values for e in res.embeddings]
 
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(min=1, max=10))
+def _embed_query(text: str) -> List[float]:
+    res = gemini.models.embed_content(
+        model=EMBED_MODEL,
+        contents=text,
+        config=types.EmbedContentConfig(output_dimensionality=EMBED_DIM),
+    )
+    return res.embeddings[0].values
 
-# Must match Pinecone index dimension (index was created with 768)
-EMBED_OUTPUT_DIM = 768
+# ── Pinecone search (metadata-filtered) ───────────────────────────────────────
 
-def get_embedding(text: str) -> List[float]:
-    """Generate embedding using Google Embeddings"""
-    try:
-        result = client.models.embed_content(
-            model=embedding_model,
-            contents=text,
-            config=types.EmbedContentConfig(output_dimensionality=EMBED_OUTPUT_DIM),
-        )
-        return result.embeddings[0].values
-    except Exception as e:
-        print(f"Error generating embedding: {e}")
-        raise
-
-def get_query_embedding(text: str) -> List[float]:
-    """Generate embedding for query using Google Embeddings"""
-    try:
-        result = client.models.embed_content(
-            model=embedding_model,
-            contents=text,
-            config=types.EmbedContentConfig(output_dimensionality=EMBED_OUTPUT_DIM),
-        )
-        return result.embeddings[0].values
-    except Exception as e:
-        print(f"Error generating query embedding: {e}")
-        raise
-
-
-# API Endpoints
-@app.get("/")
-def read_root():
-    """Root endpoint"""
-    return {
-        "message": "RAG API with Gemini",
-        "endpoints": {
-            "docs": "/docs",
-            "upload": "/upload",
-            "query": "/query",
-            "health": "/health"
+def _search(doc_type: str, query: str, top_k: int) -> List[Dict]:
+    vec = _embed_query(query)
+    res = index.query(
+        vector=vec,
+        top_k=top_k,
+        include_metadata=True,
+        filter={"type": {"$eq": doc_type}},
+    )
+    return [
+        {
+            "chunk_id": m["id"],
+            "filename": m["metadata"]["filename"],
+            "type":     m["metadata"]["type"],
+            "score":    float(m["score"]),
+            "text":     m["metadata"]["text"],
         }
+        for m in res["matches"]
+    ]
+
+# ── Gemini tool definitions ────────────────────────────────────────────────────
+
+_TOOLS = types.Tool(
+    function_declarations=[
+        types.FunctionDeclaration(
+            name="search_pests",
+            description=(
+                "Search the pests and diseases knowledge base. Use this for questions about "
+                "crop diseases, pest identification, symptoms, treatments, prevention, and "
+                "agricultural pest management."
+            ),
+            parameters=types.Schema(
+                type=types.Type.OBJECT,
+                properties={
+                    "query": types.Schema(
+                        type=types.Type.STRING,
+                        description="Specific search query for pests or diseases",
+                    ),
+                    "top_k": types.Schema(
+                        type=types.Type.INTEGER,
+                        description="Number of results to retrieve (default 5)",
+                    ),
+                },
+                required=["query"],
+            ),
+        ),
+        types.FunctionDeclaration(
+            name="search_schemes",
+            description=(
+                "Search the government schemes knowledge base. Use this for questions about "
+                "agricultural subsidies, government programs, farmer benefits, financial aid, "
+                "and agricultural policy schemes."
+            ),
+            parameters=types.Schema(
+                type=types.Type.OBJECT,
+                properties={
+                    "query": types.Schema(
+                        type=types.Type.STRING,
+                        description="Specific search query for government schemes",
+                    ),
+                    "top_k": types.Schema(
+                        type=types.Type.INTEGER,
+                        description="Number of results to retrieve (default 5)",
+                    ),
+                },
+                required=["query"],
+            ),
+        ),
+    ]
+)
+
+_TOOL_FN = {
+    "search_pests":   lambda q, k: _search("pests", q, k),
+    "search_schemes": lambda q, k: _search("schemes", q, k),
+}
+
+# ── Upload endpoint ────────────────────────────────────────────────────────────
+
+@app.post("/upload", response_model=UploadResponse, tags=["Upload"])
+async def upload(
+    file: UploadFile = File(...),
+    type: str = Form(..., description="Document type: 'pests' or 'schemes'"),
+):
+    """
+    Upload a document and index it.
+
+    - **file**: .pdf, .txt, or .docx
+    - **type**: `pests` or `schemes` — stored as metadata on every chunk
+    """
+    if type not in ALLOWED_TYPES:
+        raise HTTPException(400, f"Invalid type '{type}'. Must be one of: {', '.join(sorted(ALLOWED_TYPES))}")
+
+    text = _extract_text(file)
+    if not text.strip():
+        raise HTTPException(400, "File is empty or unreadable")
+
+    chunks = _chunk(text)
+    if not chunks:
+        raise HTTPException(400, "No valid chunks extracted from file")
+
+    print(f"[{type}] {file.filename}: {len(chunks)} chunks")
+
+    vectors = []
+    for i in range(0, len(chunks), EMBED_BATCH):
+        batch      = chunks[i : i + EMBED_BATCH]
+        embeddings = _embed_batch(batch)
+        for j, (chunk, emb) in enumerate(zip(batch, embeddings)):
+            chunk_idx = i + j
+            vectors.append({
+                "id":     f"{file.filename}_{chunk_idx}",
+                "values": emb,
+                "metadata": {
+                    "text":        chunk,
+                    "filename":    file.filename,
+                    "chunk_index": chunk_idx,
+                    "type":        type,
+                },
+            })
+        if i + EMBED_BATCH < len(chunks):
+            time.sleep(0.5)
+
+    for i in range(0, len(vectors), UPSERT_BATCH):
+        index.upsert(vectors=vectors[i : i + UPSERT_BATCH])
+
+    return UploadResponse(
+        message="Indexed successfully",
+        filename=file.filename,
+        type=type,
+        chunks_added=len(chunks),
+    )
+
+# ── Gemini generate (with retry) ──────────────────────────────────────────────
+
+@retry(stop=stop_after_attempt(4), wait=wait_exponential(min=2, max=15))
+def _generate(contents, cfg):
+    return gemini.models.generate_content(model=LLM_MODEL, contents=contents, config=cfg)
+
+# ── Query endpoint ─────────────────────────────────────────────────────────────
+
+@app.post("/query", response_model=QueryResponse, tags=["Query"])
+async def query(request: QueryRequest):
+    """
+    Ask a question. Gemini picks the right tool (`search_pests` or `search_schemes`),
+    queries the single index with a metadata filter, and returns a grounded answer.
+    """
+    history = [
+        types.Content(role="user", parts=[types.Part(text=request.question)])
+    ]
+    cfg = types.GenerateContentConfig(tools=[_TOOLS])
+
+    # Round 1 — Gemini decides which tool(s) to call
+    resp = _generate(history, cfg)
+
+    all_sources: List[Dict] = []
+    tools_used:  List[str]  = []
+
+    if resp.function_calls:
+        history.append(resp.candidates[0].content)
+        fn_response_parts = []
+
+        for fc in resp.function_calls:
+            args    = dict(fc.args)
+            top_k   = int(args.get("top_k", request.top_k))
+            q_text  = args["query"]
+            fn_name = fc.name
+
+            if fn_name not in _TOOL_FN:
+                raise HTTPException(500, f"Unknown tool requested by model: {fn_name}")
+
+            print(f"Tool → {fn_name}(query={q_text!r}, top_k={top_k})")
+            chunks = _TOOL_FN[fn_name](q_text, top_k)
+            all_sources.extend(chunks)
+            tools_used.append(fn_name)
+
+            fn_response_parts.append(
+                types.Part(
+                    function_response=types.FunctionResponse(
+                        name=fn_name,
+                        response={
+                            "chunks": [
+                                {"text": c["text"], "source": c["filename"]}
+                                for c in chunks
+                            ]
+                        },
+                    )
+                )
+            )
+
+        history.append(types.Content(role="function", parts=fn_response_parts))
+
+        # Round 2 — generate final grounded answer
+        resp = _generate(history, cfg)
+
+    return QueryResponse(
+        answer=resp.text or "No answer could be generated.",
+        sources=[SourceChunk(**s) for s in all_sources],
+        tools_used=tools_used,
+    )
+
+# ── Health & stats ─────────────────────────────────────────────────────────────
+
+@app.get("/health", tags=["System"])
+def health():
+    try:
+        stats = index.describe_index_stats()
+        return {
+            "status":       "healthy",
+            "index":        INDEX_NAME,
+            "total_vectors": stats.total_vector_count,
+        }
+    except Exception as e:
+        return {"status": "error", "detail": str(e)}
+
+
+@app.get("/stats", tags=["System"])
+def stats():
+    s = index.describe_index_stats()
+    return {
+        "index_name":    INDEX_NAME,
+        "total_vectors": s.total_vector_count,
+        "dimension":     s.dimension,
+        "index_fullness": s.index_fullness,
     }
 
-@app.get("/health")
-def health_check():
-    """Health check endpoint"""
-    try:
-        stats = index.describe_index_stats()
-        return {
-            "status": "healthy",
-            "pinecone_connected": True,
-            "total_vectors": stats.total_vector_count
-        }
-    except Exception as e:
-        return {
-            "status": "unhealthy",
-            "error": str(e)
-        }
 
-@app.post("/upload", response_model=UploadResponse)
-async def upload_file(file: UploadFile = File(...)):
-    """
-    Upload and process a document
-    
-    - **file**: Upload a .txt, .pdf, or .docx file
-    - Returns: Confirmation with number of chunks processed
-    """
-    try:
-        # Extract text from file
-        text = extract_text_from_file(file)
-        
-        if not text.strip():
-            raise HTTPException(status_code=400, detail="File is empty or unreadable")
-        
-        for model in client.models.list():
-            print(f"Model: {model.name}")
-            if 'embed' in model.name.lower():
-                print(f"  -> EMBEDDING MODEL: {model.name}")
+@app.get("/", tags=["System"])
+def root():
+    return {
+        "service": "AgriGPT RAG Service",
+        "version": "3.0.0",
+        "docs":    "/docs",
+        "endpoints": {
+            "POST /upload": "Index a document — pass file + type ('pests' or 'schemes')",
+            "POST /query":  "Ask a question — Gemini picks the right tool automatically",
+            "GET  /health": "Health check with total vector count",
+            "GET  /stats":  "Index statistics",
+        },
+    }
 
-        # Chunk the text
-        chunks = chunk_text(text)
-        
-        if not chunks:
-            raise HTTPException(status_code=400, detail="No valid chunks created from file")
-        
-        print(f"Processing {len(chunks)} chunks from {file.filename}")
-        
-        # Create embeddings and store in Pinecone
-        vectors = []
-        for i, chunk in enumerate(chunks):
-            print(f"Generating embedding for chunk {i+1}/{len(chunks)}")
-            embedding = get_embedding(chunk)
-            
-            vector_id = f"{file.filename}_{i}"
-            metadata = {
-                'text': chunk,
-                'filename': file.filename,
-                'chunk_index': i
-            }
-            
-            vectors.append({
-                'id': vector_id,
-                'values': embedding,
-                'metadata': metadata
-            })
-        
-        # Upsert to Pinecone in batches
-        batch_size = 100                             # batching the embedding vectors
-        for i in range(0, len(vectors), batch_size):
-            batch = vectors[i:i+batch_size]
-            index.upsert(vectors=batch)
-            print(f"Uploaded batch {i//batch_size + 1}")
-        
-        return UploadResponse(
-            message="File uploaded and processed successfully",
-            filename=file.filename,
-            chunks_added=len(chunks)
-        )
-    
-    except Exception as e:
-        print(f"Error in upload_file: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Error processing file: {str(e)}")
-
-@app.post("/query", response_model=QueryResponse)
-async def query_documents(request: QueryRequest):
-    """
-    Query the document database
-    
-    - **question**: Your question
-    - **top_k**: Number of relevant chunks to retrieve (default: 3)
-    - Returns: AI-generated answer with sources
-    """
-    try:
-        # Get query embedding
-        query_embedding = get_query_embedding(request.question)
-        
-        # Search Pinecone
-        results = index.query(
-            vector=query_embedding,
-            top_k=request.top_k,
-            include_metadata=True
-        )
-        
-        if not results['matches']:
-            return QueryResponse(
-                answer="No relevant information found in the database.",
-                sources=[]
-            )
-        
-        # Prepare context from retrieved chunks
-        context_parts = []
-        sources = []
-        
-        for i, match in enumerate(results['matches']):
-            context_parts.append(f"[{i+1}] {match['metadata']['text']}")
-            sources.append({
-                'chunk_id': match['id'],
-                'filename': match['metadata']['filename'],
-                'score': float(match['score']),
-                'text': match['metadata']['text'][:200] + "..."
-            })
-        
-        context = "\n\n".join(context_parts)
-        
-        # Generate answer using Gemini
-        prompt = f"""Based on the following context, answer the question. 
-If the answer cannot be found in the context, say so clearly.
-
-Context:
-{context}
-
-Question: {request.question}
-
-Answer:"""
-        
-        response = client.models.generate_content(
-            model='gemini-2.5-flash',
-            contents=prompt
-        )
-        answer = response.text
-        
-        return QueryResponse(
-            answer=answer,
-            sources=sources
-        )
-    
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error processing query: {str(e)}")
-
-@app.delete("/clear")
-async def clear_database():
-    """
-    Clear all vectors from the database
-    
-    - Returns: Confirmation message
-    """
-    try:
-        # Delete all vectors
-        index.delete(delete_all=True)
-        return {"message": "Database cleared successfully"}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error clearing database: {str(e)}")
-
-@app.get("/stats")
-async def get_stats():
-    """
-    Get database statistics
-    
-    - Returns: Current database stats
-    """
-    try:
-        stats = index.describe_index_stats()
-        return {
-            "total_vectors": stats.total_vector_count,
-            "dimension": stats.dimension,
-            "index_fullness": stats.index_fullness
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error getting stats: {str(e)}")
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8010)
+    port = int(os.getenv("PORT", 8010))
+    uvicorn.run(app, host="0.0.0.0", port=port)
