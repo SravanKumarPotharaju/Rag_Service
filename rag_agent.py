@@ -26,7 +26,7 @@ PINECONE_API_KEY  = os.getenv("PINECONE_API_KEY")
 OLLAMA_BASE_URL   = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434/v1").rstrip("/")
 OLLAMA_API_KEY    = os.getenv("OLLAMA_API_KEY", "")
 OLLAMA_MODEL      = os.getenv("OLLAMA_MODEL", "gemma4:e4b")
-OLLAMA_EMBED_MODEL = os.getenv("OLLAMA_EMBED_MODEL", "nomic-embed-text")
+OLLAMA_EMBED_MODEL = os.getenv("OLLAMA_EMBED_MODEL")
 
 if not PINECONE_API_KEY:
     raise ValueError("PINECONE_API_KEY not set")
