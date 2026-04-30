@@ -1,11 +1,11 @@
 """
-AgriGPT RAG Service  v4.2
-Single Pinecone index, metadata-filtered retrieval, Ollama tool calling via httpx.
+AgriGPT RAG Service  v5.0
+OpenAI-compatible Ollama endpoint, Pinecone RAG, auto-detects embedding dim.
 """
 
 from fastapi import FastAPI, File, Form, UploadFile, HTTPException
 from pydantic import BaseModel
-from typing import List, Dict
+from typing import List, Dict, Optional
 import os, io, time, json
 
 import httpx
@@ -20,10 +20,9 @@ load_dotenv()
 # ── Config ─────────────────────────────────────────────────────────────────────
 
 PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
-OLLAMA_BASE_URL  = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+OLLAMA_BASE_URL  = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434/v1").rstrip("/")
 OLLAMA_API_KEY   = os.getenv("OLLAMA_API_KEY", "")
 OLLAMA_MODEL     = os.getenv("OLLAMA_MODEL", "gemma4:e4b")
-RAG_BASE_URL     = os.getenv("RAG_BASE_URL", "http://localhost:8010")
 
 if not PINECONE_API_KEY:
     raise ValueError("PINECONE_API_KEY not set")
@@ -33,40 +32,82 @@ ALLOWED_TYPES = {"pests", "schemes"}
 
 CHUNK_SIZE    = 1000
 CHUNK_OVERLAP = 200
-EMBED_DIM     = int(os.getenv("EMBED_DIM", "3072"))
 EMBED_BATCH   = 20
 UPSERT_BATCH  = 100
+OLLAMA_TIMEOUT = 300.0
 
-OLLAMA_TIMEOUT = 300.0  # 5 min — large model needs time
-_AUTH_HEADERS  = {"Authorization": f"Bearer {OLLAMA_API_KEY}"} if OLLAMA_API_KEY else {}
+_AUTH_HEADERS = {
+    "Authorization": f"Bearer {OLLAMA_API_KEY}",
+    "Content-Type": "application/json",
+}
 
-# ── Pinecone client ────────────────────────────────────────────────────────────
+# ── Clients ────────────────────────────────────────────────────────────────────
 
 pc = Pinecone(api_key=PINECONE_API_KEY)
 
 app = FastAPI(
     title="AgriGPT RAG Service",
-    description="Single-index RAG with metadata filtering and Ollama tool calling",
-    version="4.2.0",
+    description="OpenAI-compatible Ollama + Pinecone RAG",
+    version="5.0.0",
 )
 
-# ── Pinecone setup ─────────────────────────────────────────────────────────────
+# ── Embedding helpers ──────────────────────────────────────────────────────────
 
-def _init_index():
-    existing = {idx["name"] for idx in pc.list_indexes()}
-    if INDEX_NAME not in existing:
-        print(f"Creating Pinecone index: {INDEX_NAME} (dim={EMBED_DIM})")
-        pc.create_index(
-            name=INDEX_NAME,
-            dimension=EMBED_DIM,
-            metric="cosine",
-            spec=ServerlessSpec(cloud="aws", region="us-east-1"),
+def _raw_embed(input_data) -> List[List[float]]:
+    """Call /embeddings (OpenAI-compatible). input_data: str or List[str]."""
+    with httpx.Client(timeout=OLLAMA_TIMEOUT) as http:
+        r = http.post(
+            f"{OLLAMA_BASE_URL}/embeddings",
+            json={"model": OLLAMA_MODEL, "input": input_data},
+            headers=_AUTH_HEADERS,
         )
-    else:
-        print(f"Connected to existing index: {INDEX_NAME}")
+        if r.status_code != 200:
+            print(f"[EMBED] {r.status_code}: {r.text[:300]}")
+            r.raise_for_status()
+        data = r.json()
+        return [item["embedding"] for item in data["data"]]
+
+
+def _detect_embed_dim() -> int:
+    try:
+        vec = _raw_embed("test")[0]
+        dim = len(vec)
+        print(f"[EMBED] detected dim={dim}")
+        return dim
+    except Exception as e:
+        fallback = int(os.getenv("EMBED_DIM", "768"))
+        print(f"[EMBED] dim detection failed ({e}), using {fallback}")
+        return fallback
+
+
+# ── Pinecone setup (auto-recreate on dim mismatch) ────────────────────────────
+
+def _init_index(dim: int):
+    existing = {idx["name"] for idx in pc.list_indexes()}
+
+    if INDEX_NAME in existing:
+        desc = pc.describe_index(INDEX_NAME)
+        if desc.dimension != dim:
+            print(f"[PINECONE] dim mismatch: index={desc.dimension} model={dim} → recreating")
+            pc.delete_index(INDEX_NAME)
+            time.sleep(10)
+            existing = set()
+        else:
+            print(f"[PINECONE] connected: {INDEX_NAME} (dim={dim})")
+            return pc.Index(INDEX_NAME)
+
+    print(f"[PINECONE] creating: {INDEX_NAME} (dim={dim})")
+    pc.create_index(
+        name=INDEX_NAME,
+        dimension=dim,
+        metric="cosine",
+        spec=ServerlessSpec(cloud="aws", region="us-east-1"),
+    )
     return pc.Index(INDEX_NAME)
 
-index = _init_index()
+
+EMBED_DIM = _detect_embed_dim()
+index     = _init_index(EMBED_DIM)
 
 # ── Pydantic models ────────────────────────────────────────────────────────────
 
@@ -115,95 +156,78 @@ def _chunk(text: str) -> List[str]:
         start += CHUNK_SIZE - CHUNK_OVERLAP
     return chunks
 
-# ── Ollama helpers (direct httpx calls) ───────────────────────────────────────
-
-def _raw_embed(text: str) -> List[float]:
-    """Try /api/embed (new), fall back to /api/embeddings (old)."""
-    with httpx.Client(timeout=OLLAMA_TIMEOUT) as http:
-        # Try newer endpoint first
-        r = http.post(
-            f"{OLLAMA_BASE_URL}/api/embed",
-            json={"model": OLLAMA_MODEL, "input": text},
-            headers=_AUTH_HEADERS,
-        )
-        if r.status_code == 200:
-            return r.json()["embeddings"][0]
-
-        print(f"[EMBED] /api/embed failed ({r.status_code}): {r.text[:200]}")
-
-        # Fall back to older endpoint
-        r = http.post(
-            f"{OLLAMA_BASE_URL}/api/embeddings",
-            json={"model": OLLAMA_MODEL, "prompt": text},
-            headers=_AUTH_HEADERS,
-        )
-        if r.status_code == 200:
-            return r.json()["embedding"]
-
-        print(f"[EMBED] /api/embeddings failed ({r.status_code}): {r.text[:200]}")
-        r.raise_for_status()
-
+# ── Embed functions ────────────────────────────────────────────────────────────
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=1, max=10))
 def _embed_batch(texts: List[str]) -> List[List[float]]:
-    return [_raw_embed(t) for t in texts]
-
+    return _raw_embed(texts)
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=1, max=10))
 def _embed_query(text: str) -> List[float]:
-    return _raw_embed(text)
+    return _raw_embed(text)[0]
 
-def _parse_ndjson(text: str) -> Dict:
-    """
-    Ollama streams NDJSON even when stream=False.
-    tool_calls appear in early lines; content is spread across all lines.
-    """
-    lines = [l.strip() for l in text.strip().splitlines() if l.strip()]
-    if len(lines) == 1:
-        return json.loads(lines[0])
+# ── Chat helper (handles SSE streaming + regular JSON) ────────────────────────
 
-    content_parts = []
-    tool_calls    = []
-    final         = {}
-    for line in lines:
+def _parse_sse(text: str) -> Dict:
+    """Accumulate SSE chunks into a single OpenAI-format response dict."""
+    content_parts  = []
+    tool_calls_map = {}
+
+    for line in text.splitlines():
+        if not line.startswith("data:"):
+            continue
+        data = line[5:].strip()
+        if data == "[DONE]":
+            break
         try:
-            obj = json.loads(line)
-            msg = obj.get("message", {})
-            if msg.get("content"):
-                content_parts.append(msg["content"])
-            if msg.get("tool_calls"):
-                tool_calls = msg["tool_calls"]
-            if obj.get("done"):
-                final = obj
+            chunk = json.loads(data)
+            delta = chunk.get("choices", [{}])[0].get("delta", {})
+            if delta.get("content"):
+                content_parts.append(delta["content"])
+            for tc in delta.get("tool_calls", []):
+                idx = tc.get("index", 0)
+                if idx not in tool_calls_map:
+                    tool_calls_map[idx] = {
+                        "id": tc.get("id", f"call_{idx}"),
+                        "type": "function",
+                        "function": {"name": "", "arguments": ""},
+                    }
+                if tc.get("id"):
+                    tool_calls_map[idx]["id"] = tc["id"]
+                fn = tc.get("function", {})
+                tool_calls_map[idx]["function"]["name"]      += fn.get("name", "")
+                tool_calls_map[idx]["function"]["arguments"] += fn.get("arguments", "")
         except json.JSONDecodeError:
             pass
 
-    if not final and lines:
-        final = json.loads(lines[-1])
+    message: Dict = {"role": "assistant", "content": "".join(content_parts)}
+    if tool_calls_map:
+        message["tool_calls"] = [tool_calls_map[i] for i in sorted(tool_calls_map)]
 
-    final.setdefault("message", {})
-    final["message"]["content"] = "".join(content_parts)
-    if tool_calls:
-        final["message"]["tool_calls"] = tool_calls
-
-    print(f"[CHAT] content={final['message']['content'][:80]!r}  tool_calls={bool(tool_calls)}")
-    return final
+    return {"choices": [{"message": message}]}
 
 
-def _chat(messages: List[Dict], tools: List[Dict] = None) -> Dict:
-    payload = {"model": OLLAMA_MODEL, "messages": messages, "stream": False}
+def _chat(messages: List[Dict], tools: Optional[List[Dict]] = None) -> Dict:
+    payload: Dict = {"model": OLLAMA_MODEL, "messages": messages, "stream": False}
     if tools:
         payload["tools"] = tools
+
     with httpx.Client(timeout=OLLAMA_TIMEOUT) as http:
         r = http.post(
-            f"{OLLAMA_BASE_URL}/api/chat",
+            f"{OLLAMA_BASE_URL}/chat/completions",
             json=payload,
             headers=_AUTH_HEADERS,
         )
-        r.raise_for_status()
-        return _parse_ndjson(r.text)
+        if r.status_code != 200:
+            print(f"[CHAT] {r.status_code}: {r.text[:300]}")
+            r.raise_for_status()
 
-# ── Pinecone search (metadata-filtered) ───────────────────────────────────────
+        text = r.text.strip()
+        if text.startswith("data:"):      # server ignored stream=False
+            return _parse_sse(text)
+        return json.loads(text)
+
+# ── Pinecone search ────────────────────────────────────────────────────────────
 
 def _search(doc_type: str, query: str, top_k: int) -> List[Dict]:
     vec = _embed_query(query)
@@ -224,7 +248,7 @@ def _search(doc_type: str, query: str, top_k: int) -> List[Dict]:
         for m in res["matches"]
     ]
 
-# ── Tool definitions ───────────────────────────────────────────────────────────
+# ── Tool definitions (OpenAI format) ──────────────────────────────────────────
 
 _TOOLS = [
     {
@@ -232,15 +256,14 @@ _TOOLS = [
         "function": {
             "name": "search_pests",
             "description": (
-                "Search the pests and diseases knowledge base. Use this for questions about "
-                "crop diseases, pest identification, symptoms, treatments, prevention, and "
-                "agricultural pest management."
+                "Search the pests and diseases knowledge base for questions about "
+                "crop diseases, pest identification, symptoms, treatments and prevention."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "query": {"type": "string", "description": "Specific search query for pests or diseases"},
-                    "top_k": {"type": "integer", "description": "Number of results to retrieve (default 5)"},
+                    "query": {"type": "string"},
+                    "top_k": {"type": "integer"},
                 },
                 "required": ["query"],
             },
@@ -251,15 +274,14 @@ _TOOLS = [
         "function": {
             "name": "search_schemes",
             "description": (
-                "Search the government schemes knowledge base. Use this for questions about "
-                "agricultural subsidies, government programs, farmer benefits, financial aid, "
-                "and agricultural policy schemes."
+                "Search the government schemes knowledge base for questions about "
+                "agricultural subsidies, programs, farmer benefits and financial aid."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "query": {"type": "string", "description": "Specific search query for government schemes"},
-                    "top_k": {"type": "integer", "description": "Number of results to retrieve (default 5)"},
+                    "query": {"type": "string"},
+                    "top_k": {"type": "integer"},
                 },
                 "required": ["query"],
             },
@@ -277,10 +299,10 @@ _TOOL_FN = {
 @app.post("/upload", response_model=UploadResponse, tags=["Upload"])
 async def upload(
     file: UploadFile = File(...),
-    type: str = Form(..., description="Document type: 'pests' or 'schemes'"),
+    type: str = Form(...),
 ):
     if type not in ALLOWED_TYPES:
-        raise HTTPException(400, f"Invalid type '{type}'. Must be one of: {', '.join(sorted(ALLOWED_TYPES))}")
+        raise HTTPException(400, f"type must be one of: {', '.join(sorted(ALLOWED_TYPES))}")
 
     text = _extract_text(file)
     if not text.strip():
@@ -288,9 +310,9 @@ async def upload(
 
     chunks = _chunk(text)
     if not chunks:
-        raise HTTPException(400, "No valid chunks extracted from file")
+        raise HTTPException(400, "No valid chunks extracted")
 
-    print(f"[{type}] {file.filename}: {len(chunks)} chunks")
+    print(f"[UPLOAD] {file.filename} ({type}): {len(chunks)} chunks")
 
     vectors = []
     for i in range(0, len(chunks), EMBED_BATCH):
@@ -325,22 +347,19 @@ async def upload(
 
 @app.post("/query", response_model=QueryResponse, tags=["Query"])
 async def query(request: QueryRequest):
-    messages = [{"role": "user", "content": request.question}]
+    messages: List[Dict] = [{"role": "user", "content": request.question}]
 
     resp = _chat(messages, tools=_TOOLS)
-    msg  = resp.get("message", {})
+    msg  = resp["choices"][0]["message"]
 
     all_sources: List[Dict] = []
     tools_used:  List[str]  = []
-
     tool_calls = msg.get("tool_calls") or []
 
+    print(f"[QUERY] tool_calls={bool(tool_calls)}  content={str(msg.get('content',''))[:80]!r}")
+
     if tool_calls:
-        messages.append({
-            "role": "assistant",
-            "content": msg.get("content") or "",
-            "tool_calls": tool_calls,
-        })
+        messages.append(msg)
 
         for tc in tool_calls:
             fn_name = tc["function"]["name"]
@@ -353,24 +372,25 @@ async def query(request: QueryRequest):
             if fn_name not in _TOOL_FN:
                 raise HTTPException(500, f"Unknown tool: {fn_name}")
 
-            print(f"Tool → {fn_name}(query={q_text!r}, top_k={top_k})")
+            print(f"[TOOL] {fn_name}(query={q_text!r}, top_k={top_k})")
             chunks = _TOOL_FN[fn_name](q_text, top_k)
             all_sources.extend(chunks)
             tools_used.append(fn_name)
 
             messages.append({
-                "role": "tool",
-                "content": json.dumps({
+                "role":         "tool",
+                "tool_call_id": tc["id"],
+                "content":      json.dumps({
                     "chunks": [{"text": c["text"], "source": c["filename"]} for c in chunks]
                 }),
             })
 
         resp = _chat(messages)
-        msg  = resp.get("message", {})
+        msg  = resp["choices"][0]["message"]
 
     else:
-        # Fallback: model didn't call tools — search both indexes directly
-        print("No tool calls — falling back to direct search")
+        # Fallback: model skipped tools → search directly
+        print("[QUERY] No tool calls — using direct search fallback")
         for doc_type in ("pests", "schemes"):
             chunks = _search(doc_type, request.question, request.top_k)
             if chunks:
@@ -379,26 +399,24 @@ async def query(request: QueryRequest):
 
         if all_sources:
             context = "\n\n".join(f"[{c['filename']}]: {c['text']}" for c in all_sources)
-            messages.append({
-                "role": "user",
-                "content": (
-                    f"Use the following context to answer the question.\n\n"
+            messages = [
+                {"role": "user", "content": (
+                    f"Answer the question using only the context below.\n\n"
                     f"Context:\n{context}\n\n"
                     f"Question: {request.question}"
-                ),
-            })
+                )}
+            ]
             resp = _chat(messages)
-            msg  = resp.get("message", {})
+            msg  = resp["choices"][0]["message"]
 
     answer = msg.get("content") or "No answer could be generated."
-
     return QueryResponse(
         answer=answer,
         sources=[SourceChunk(**s) for s in all_sources],
         tools_used=tools_used,
     )
 
-# ── Health & stats ─────────────────────────────────────────────────────────────
+# ── System endpoints ───────────────────────────────────────────────────────────
 
 @app.get("/health", tags=["System"])
 def health():
@@ -408,6 +426,7 @@ def health():
             "status":        "healthy",
             "index":         INDEX_NAME,
             "total_vectors": stats.total_vector_count,
+            "embed_dim":     EMBED_DIM,
             "model":         OLLAMA_MODEL,
         }
     except Exception as e:
@@ -428,16 +447,11 @@ def stats():
 @app.get("/", tags=["System"])
 def root():
     return {
-        "service": "AgriGPT RAG Service",
-        "version": "4.2.0",
-        "model":   OLLAMA_MODEL,
-        "docs":    "/docs",
-        "endpoints": {
-            "POST /upload": "Index a document — pass file + type ('pests' or 'schemes')",
-            "POST /query":  "Ask a question — model picks the right tool automatically",
-            "GET  /health": "Health check with total vector count",
-            "GET  /stats":  "Index statistics",
-        },
+        "service":   "AgriGPT RAG Service",
+        "version":   "5.0.0",
+        "model":     OLLAMA_MODEL,
+        "embed_dim": EMBED_DIM,
+        "docs":      "/docs",
     }
 
 
