@@ -1,5 +1,5 @@
 """
-AgriGPT RAG Service  v4.0
+AgriGPT RAG Service  v4.1
 Single Pinecone index, metadata-filtered retrieval, Ollama tool calling.
 """
 
@@ -9,7 +9,7 @@ from typing import List, Dict
 import os, io, time, json
 
 from pinecone import Pinecone, ServerlessSpec
-from openai import OpenAI
+import ollama
 from PyPDF2 import PdfReader
 import docx
 from dotenv import load_dotenv
@@ -20,8 +20,8 @@ load_dotenv()
 # ── Config ─────────────────────────────────────────────────────────────────────
 
 PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
-OLLAMA_BASE_URL  = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434/v1")
-OLLAMA_API_KEY   = os.getenv("OLLAMA_API_KEY", "ollama")
+OLLAMA_BASE_URL  = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+OLLAMA_API_KEY   = os.getenv("OLLAMA_API_KEY", "")
 OLLAMA_MODEL     = os.getenv("OLLAMA_MODEL", "gemma4:26b")
 RAG_BASE_URL     = os.getenv("RAG_BASE_URL", "http://localhost:8010")
 
@@ -39,17 +39,17 @@ UPSERT_BATCH  = 100
 
 # ── Clients ────────────────────────────────────────────────────────────────────
 
-pc     = Pinecone(api_key=PINECONE_API_KEY)
-client = OpenAI(
-    base_url=OLLAMA_BASE_URL,
-    api_key=OLLAMA_API_KEY,
-    timeout=300.0,  # 5 min — 26B models need time to generate
+pc = Pinecone(api_key=PINECONE_API_KEY)
+
+ollama_client = ollama.Client(
+    host=OLLAMA_BASE_URL,
+    headers={"Authorization": f"Bearer {OLLAMA_API_KEY}"} if OLLAMA_API_KEY else {},
 )
 
 app = FastAPI(
     title="AgriGPT RAG Service",
     description="Single-index RAG with metadata filtering and Ollama tool calling",
-    version="4.0.0",
+    version="4.1.0",
 )
 
 # ── Pinecone setup ─────────────────────────────────────────────────────────────
@@ -121,13 +121,13 @@ def _chunk(text: str) -> List[str]:
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=1, max=10))
 def _embed_batch(texts: List[str]) -> List[List[float]]:
-    res = client.embeddings.create(model=OLLAMA_MODEL, input=texts)
-    return [e.embedding for e in res.data]
+    res = ollama_client.embed(model=OLLAMA_MODEL, input=texts)
+    return res.embeddings
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=1, max=10))
 def _embed_query(text: str) -> List[float]:
-    res = client.embeddings.create(model=OLLAMA_MODEL, input=text)
-    return res.data[0].embedding
+    res = ollama_client.embed(model=OLLAMA_MODEL, input=text)
+    return res.embeddings[0]
 
 # ── Pinecone search (metadata-filtered) ───────────────────────────────────────
 
@@ -150,7 +150,7 @@ def _search(doc_type: str, query: str, top_k: int) -> List[Dict]:
         for m in res["matches"]
     ]
 
-# ── Tool definitions (OpenAI format) ──────────────────────────────────────────
+# ── Tool definitions ───────────────────────────────────────────────────────────
 
 _TOOLS = [
     {
@@ -221,7 +221,7 @@ async def upload(
     Upload a document and index it.
 
     - **file**: .pdf, .txt, or .docx
-    - **type**: `pests` or `schemes` — stored as metadata on every chunk
+    - **type**: `pests` or `schemes`
     """
     if type not in ALLOWED_TYPES:
         raise HTTPException(400, f"Invalid type '{type}'. Must be one of: {', '.join(sorted(ALLOWED_TYPES))}")
@@ -270,28 +270,27 @@ async def upload(
 @app.post("/query", response_model=QueryResponse, tags=["Query"])
 async def query(request: QueryRequest):
     """
-    Ask a question. The model picks the right tool (`search_pests` or `search_schemes`),
-    queries the single index with a metadata filter, and returns a grounded answer.
+    Ask a question. The model picks the right tool, queries Pinecone with a
+    metadata filter, and returns a grounded answer.
     """
     messages = [{"role": "user", "content": request.question}]
 
-    resp = client.chat.completions.create(
-        model=OLLAMA_MODEL,
-        messages=messages,
-        tools=_TOOLS,
-    )
+    resp = ollama_client.chat(model=OLLAMA_MODEL, messages=messages, tools=_TOOLS)
 
     all_sources: List[Dict] = []
     tools_used:  List[str]  = []
 
-    msg = resp.choices[0].message
+    if resp.message.tool_calls:
+        # Append assistant message with tool calls to history
+        messages.append({"role": "assistant", "content": resp.message.content or "", "tool_calls": [
+            {"function": {"name": tc.function.name, "arguments": tc.function.arguments}}
+            for tc in resp.message.tool_calls
+        ]})
 
-    if msg.tool_calls:
-        messages.append(msg)
-
-        for tc in msg.tool_calls:
+        for tc in resp.message.tool_calls:
             fn_name = tc.function.name
-            args    = json.loads(tc.function.arguments)
+            # ollama returns arguments as a dict, not a JSON string
+            args    = tc.function.arguments if isinstance(tc.function.arguments, dict) else json.loads(tc.function.arguments)
             top_k   = int(args.get("top_k", request.top_k))
             q_text  = args["query"]
 
@@ -305,7 +304,6 @@ async def query(request: QueryRequest):
 
             messages.append({
                 "role": "tool",
-                "tool_call_id": tc.id,
                 "content": json.dumps({
                     "chunks": [
                         {"text": c["text"], "source": c["filename"]}
@@ -315,13 +313,9 @@ async def query(request: QueryRequest):
             })
 
         # Round 2 — generate final grounded answer
-        resp = client.chat.completions.create(
-            model=OLLAMA_MODEL,
-            messages=messages,
-            tools=_TOOLS,
-        )
+        resp = ollama_client.chat(model=OLLAMA_MODEL, messages=messages)
 
-    answer = resp.choices[0].message.content or "No answer could be generated."
+    answer = resp.message.content or "No answer could be generated."
 
     return QueryResponse(
         answer=answer,
@@ -360,7 +354,7 @@ def stats():
 def root():
     return {
         "service": "AgriGPT RAG Service",
-        "version": "4.0.0",
+        "version": "4.1.0",
         "model":   OLLAMA_MODEL,
         "docs":    "/docs",
         "endpoints": {
