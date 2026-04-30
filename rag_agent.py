@@ -1,6 +1,6 @@
 """
-AgriGPT RAG Service  v4.1
-Single Pinecone index, metadata-filtered retrieval, Ollama tool calling.
+AgriGPT RAG Service  v4.2
+Single Pinecone index, metadata-filtered retrieval, Ollama tool calling via httpx.
 """
 
 from fastapi import FastAPI, File, Form, UploadFile, HTTPException
@@ -8,8 +8,8 @@ from pydantic import BaseModel
 from typing import List, Dict
 import os, io, time, json
 
+import httpx
 from pinecone import Pinecone, ServerlessSpec
-import ollama
 from PyPDF2 import PdfReader
 import docx
 from dotenv import load_dotenv
@@ -22,7 +22,7 @@ load_dotenv()
 PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
 OLLAMA_BASE_URL  = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
 OLLAMA_API_KEY   = os.getenv("OLLAMA_API_KEY", "")
-OLLAMA_MODEL     = os.getenv("OLLAMA_MODEL", "gemma4:26b")
+OLLAMA_MODEL     = os.getenv("OLLAMA_MODEL", "gemma4:e4b")
 RAG_BASE_URL     = os.getenv("RAG_BASE_URL", "http://localhost:8010")
 
 if not PINECONE_API_KEY:
@@ -37,19 +37,17 @@ EMBED_DIM     = int(os.getenv("EMBED_DIM", "3072"))
 EMBED_BATCH   = 20
 UPSERT_BATCH  = 100
 
-# ── Clients ────────────────────────────────────────────────────────────────────
+OLLAMA_TIMEOUT = 300.0  # 5 min — large model needs time
+_AUTH_HEADERS  = {"Authorization": f"Bearer {OLLAMA_API_KEY}"} if OLLAMA_API_KEY else {}
+
+# ── Pinecone client ────────────────────────────────────────────────────────────
 
 pc = Pinecone(api_key=PINECONE_API_KEY)
-
-ollama_client = ollama.Client(
-    host=OLLAMA_BASE_URL,
-    headers={"Authorization": f"Bearer {OLLAMA_API_KEY}"} if OLLAMA_API_KEY else {},
-)
 
 app = FastAPI(
     title="AgriGPT RAG Service",
     description="Single-index RAG with metadata filtering and Ollama tool calling",
-    version="4.1.0",
+    version="4.2.0",
 )
 
 # ── Pinecone setup ─────────────────────────────────────────────────────────────
@@ -117,17 +115,71 @@ def _chunk(text: str) -> List[str]:
         start += CHUNK_SIZE - CHUNK_OVERLAP
     return chunks
 
-# ── Embeddings ─────────────────────────────────────────────────────────────────
+# ── Ollama helpers (direct httpx calls) ───────────────────────────────────────
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=1, max=10))
 def _embed_batch(texts: List[str]) -> List[List[float]]:
-    res = ollama_client.embed(model=OLLAMA_MODEL, input=texts)
-    return res.embeddings
+    with httpx.Client(timeout=OLLAMA_TIMEOUT) as http:
+        r = http.post(
+            f"{OLLAMA_BASE_URL}/api/embed",
+            json={"model": OLLAMA_MODEL, "input": texts},
+            headers=_AUTH_HEADERS,
+        )
+        r.raise_for_status()
+        return r.json()["embeddings"]
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=1, max=10))
 def _embed_query(text: str) -> List[float]:
-    res = ollama_client.embed(model=OLLAMA_MODEL, input=text)
-    return res.embeddings[0]
+    with httpx.Client(timeout=OLLAMA_TIMEOUT) as http:
+        r = http.post(
+            f"{OLLAMA_BASE_URL}/api/embed",
+            json={"model": OLLAMA_MODEL, "input": text},
+            headers=_AUTH_HEADERS,
+        )
+        r.raise_for_status()
+        return r.json()["embeddings"][0]
+
+def _parse_ndjson(text: str) -> Dict:
+    """
+    Ollama sometimes streams NDJSON even when stream=False.
+    Accumulate content chunks and return the final assembled response.
+    """
+    lines = [l.strip() for l in text.strip().splitlines() if l.strip()]
+    if len(lines) == 1:
+        return json.loads(lines[0])
+
+    content_parts = []
+    final = {}
+    for line in lines:
+        try:
+            obj = json.loads(line)
+            chunk = obj.get("message", {}).get("content", "")
+            if chunk:
+                content_parts.append(chunk)
+            if obj.get("done"):
+                final = obj
+        except json.JSONDecodeError:
+            pass
+
+    if final:
+        final.setdefault("message", {})["content"] = "".join(content_parts)
+        return final
+
+    return json.loads(lines[-1])
+
+
+def _chat(messages: List[Dict], tools: List[Dict] = None) -> Dict:
+    payload = {"model": OLLAMA_MODEL, "messages": messages, "stream": False}
+    if tools:
+        payload["tools"] = tools
+    with httpx.Client(timeout=OLLAMA_TIMEOUT) as http:
+        r = http.post(
+            f"{OLLAMA_BASE_URL}/api/chat",
+            json=payload,
+            headers=_AUTH_HEADERS,
+        )
+        r.raise_for_status()
+        return _parse_ndjson(r.text)
 
 # ── Pinecone search (metadata-filtered) ───────────────────────────────────────
 
@@ -165,14 +217,8 @@ _TOOLS = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "query": {
-                        "type": "string",
-                        "description": "Specific search query for pests or diseases",
-                    },
-                    "top_k": {
-                        "type": "integer",
-                        "description": "Number of results to retrieve (default 5)",
-                    },
+                    "query": {"type": "string", "description": "Specific search query for pests or diseases"},
+                    "top_k": {"type": "integer", "description": "Number of results to retrieve (default 5)"},
                 },
                 "required": ["query"],
             },
@@ -190,14 +236,8 @@ _TOOLS = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "query": {
-                        "type": "string",
-                        "description": "Specific search query for government schemes",
-                    },
-                    "top_k": {
-                        "type": "integer",
-                        "description": "Number of results to retrieve (default 5)",
-                    },
+                    "query": {"type": "string", "description": "Specific search query for government schemes"},
+                    "top_k": {"type": "integer", "description": "Number of results to retrieve (default 5)"},
                 },
                 "required": ["query"],
             },
@@ -217,12 +257,6 @@ async def upload(
     file: UploadFile = File(...),
     type: str = Form(..., description="Document type: 'pests' or 'schemes'"),
 ):
-    """
-    Upload a document and index it.
-
-    - **file**: .pdf, .txt, or .docx
-    - **type**: `pests` or `schemes`
-    """
     if type not in ALLOWED_TYPES:
         raise HTTPException(400, f"Invalid type '{type}'. Must be one of: {', '.join(sorted(ALLOWED_TYPES))}")
 
@@ -269,33 +303,33 @@ async def upload(
 
 @app.post("/query", response_model=QueryResponse, tags=["Query"])
 async def query(request: QueryRequest):
-    """
-    Ask a question. The model picks the right tool, queries Pinecone with a
-    metadata filter, and returns a grounded answer.
-    """
     messages = [{"role": "user", "content": request.question}]
 
-    resp = ollama_client.chat(model=OLLAMA_MODEL, messages=messages, tools=_TOOLS)
+    resp = _chat(messages, tools=_TOOLS)
+    msg  = resp.get("message", {})
 
     all_sources: List[Dict] = []
     tools_used:  List[str]  = []
 
-    if resp.message.tool_calls:
-        # Append assistant message with tool calls to history
-        messages.append({"role": "assistant", "content": resp.message.content or "", "tool_calls": [
-            {"function": {"name": tc.function.name, "arguments": tc.function.arguments}}
-            for tc in resp.message.tool_calls
-        ]})
+    tool_calls = msg.get("tool_calls") or []
 
-        for tc in resp.message.tool_calls:
-            fn_name = tc.function.name
-            # ollama returns arguments as a dict, not a JSON string
-            args    = tc.function.arguments if isinstance(tc.function.arguments, dict) else json.loads(tc.function.arguments)
-            top_k   = int(args.get("top_k", request.top_k))
-            q_text  = args["query"]
+    if tool_calls:
+        messages.append({
+            "role": "assistant",
+            "content": msg.get("content") or "",
+            "tool_calls": tool_calls,
+        })
+
+        for tc in tool_calls:
+            fn_name = tc["function"]["name"]
+            args    = tc["function"]["arguments"]
+            if isinstance(args, str):
+                args = json.loads(args)
+            top_k  = int(args.get("top_k", request.top_k))
+            q_text = args["query"]
 
             if fn_name not in _TOOL_FN:
-                raise HTTPException(500, f"Unknown tool requested by model: {fn_name}")
+                raise HTTPException(500, f"Unknown tool: {fn_name}")
 
             print(f"Tool → {fn_name}(query={q_text!r}, top_k={top_k})")
             chunks = _TOOL_FN[fn_name](q_text, top_k)
@@ -305,17 +339,14 @@ async def query(request: QueryRequest):
             messages.append({
                 "role": "tool",
                 "content": json.dumps({
-                    "chunks": [
-                        {"text": c["text"], "source": c["filename"]}
-                        for c in chunks
-                    ]
+                    "chunks": [{"text": c["text"], "source": c["filename"]} for c in chunks]
                 }),
             })
 
-        # Round 2 — generate final grounded answer
-        resp = ollama_client.chat(model=OLLAMA_MODEL, messages=messages)
+        resp = _chat(messages)
+        msg  = resp.get("message", {})
 
-    answer = resp.message.content or "No answer could be generated."
+    answer = msg.get("content") or "No answer could be generated."
 
     return QueryResponse(
         answer=answer,
@@ -354,7 +385,7 @@ def stats():
 def root():
     return {
         "service": "AgriGPT RAG Service",
-        "version": "4.1.0",
+        "version": "4.2.0",
         "model":   OLLAMA_MODEL,
         "docs":    "/docs",
         "endpoints": {
