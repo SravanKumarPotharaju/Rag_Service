@@ -1,12 +1,15 @@
 """
-AgriGPT RAG Service  v5.0
-OpenAI-compatible Ollama endpoint, Pinecone RAG, auto-detects embedding dim.
+AgriGPT RAG Service  v5.2
+Embeddings  → Ollama native  /api/embed  (host root)
+Chat        → Ollama OpenAI  /v1/chat/completions
+Vector DB   → Pinecone (auto-recreates on dim mismatch)
 """
 
 from fastapi import FastAPI, File, Form, UploadFile, HTTPException
 from pydantic import BaseModel
 from typing import List, Dict, Optional
 import os, io, time, json
+from urllib.parse import urlparse
 
 import httpx
 from pinecone import Pinecone, ServerlessSpec
@@ -27,76 +30,97 @@ OLLAMA_MODEL     = os.getenv("OLLAMA_MODEL", "gemma4:e4b")
 if not PINECONE_API_KEY:
     raise ValueError("PINECONE_API_KEY not set")
 
+# Derive host root for native Ollama embedding endpoints
+_parsed    = urlparse(OLLAMA_BASE_URL)
+OLLAMA_HOST = f"{_parsed.scheme}://{_parsed.netloc}"   # e.g. http://3.109.63.164
+
 INDEX_NAME    = os.getenv("PINECONE_INDEX_NAME", "agriculture-knowledge-base")
 ALLOWED_TYPES = {"pests", "schemes"}
 
-CHUNK_SIZE    = 1000
-CHUNK_OVERLAP = 200
-EMBED_BATCH   = 20
-UPSERT_BATCH  = 100
+CHUNK_SIZE     = 1000
+CHUNK_OVERLAP  = 200
+EMBED_BATCH    = 5       # small batches — large model, avoid timeouts
+UPSERT_BATCH   = 100
 OLLAMA_TIMEOUT = 300.0
 
-_AUTH_HEADERS = {
+_HEADERS = {
     "Authorization": f"Bearer {OLLAMA_API_KEY}",
-    "Content-Type": "application/json",
+    "Content-Type":  "application/json",
 }
 
-# ── Clients ────────────────────────────────────────────────────────────────────
+# ── Pinecone ───────────────────────────────────────────────────────────────────
 
-pc = Pinecone(api_key=PINECONE_API_KEY)
+pc  = Pinecone(api_key=PINECONE_API_KEY)
 
 app = FastAPI(
     title="AgriGPT RAG Service",
-    description="OpenAI-compatible Ollama + Pinecone RAG",
-    version="5.0.0",
+    description="Ollama embeddings + chat, Pinecone vector store",
+    version="5.2.0",
 )
 
 # ── Embedding helpers ──────────────────────────────────────────────────────────
 
-def _raw_embed(input_data) -> List[List[float]]:
-    """Call /embeddings (OpenAI-compatible). input_data: str or List[str]."""
+def _ollama_embed(texts) -> List[List[float]]:
+    """
+    Try native Ollama endpoints on the host root.
+    /api/embed  (Ollama >= 0.3, batch)  → {"embeddings": [[...]]}
+    /api/embeddings  (older, single)    → {"embedding": [...]}
+    """
+    if isinstance(texts, str):
+        texts = [texts]
+
     with httpx.Client(timeout=OLLAMA_TIMEOUT) as http:
+        # Try newer batch endpoint first
         r = http.post(
-            f"{OLLAMA_BASE_URL}/embeddings",
-            json={"model": OLLAMA_MODEL, "input": input_data},
-            headers=_AUTH_HEADERS,
+            f"{OLLAMA_HOST}/api/embed",
+            json={"model": OLLAMA_MODEL, "input": texts},
+            headers=_HEADERS,
         )
-        if r.status_code != 200:
-            print(f"[EMBED] {r.status_code}: {r.text[:300]}")
-            r.raise_for_status()
-        data = r.json()
-        return [item["embedding"] for item in data["data"]]
+        if r.status_code == 200:
+            return r.json()["embeddings"]
+        print(f"[EMBED] /api/embed {r.status_code}: {r.text[:200]}")
+
+        # Fall back to older single-text endpoint
+        results = []
+        for t in texts:
+            r2 = http.post(
+                f"{OLLAMA_HOST}/api/embeddings",
+                json={"model": OLLAMA_MODEL, "prompt": t},
+                headers=_HEADERS,
+            )
+            if r2.status_code == 200:
+                results.append(r2.json()["embedding"])
+            else:
+                print(f"[EMBED] /api/embeddings {r2.status_code}: {r2.text[:200]}")
+                r2.raise_for_status()
+        return results
 
 
-def _detect_embed_dim() -> int:
+def _detect_dim() -> int:
     try:
-        vec = _raw_embed("test")[0]
-        dim = len(vec)
-        print(f"[EMBED] detected dim={dim}")
-        return dim
+        vec = _ollama_embed("test")[0]
+        print(f"[EMBED] dim={len(vec)}")
+        return len(vec)
     except Exception as e:
-        fallback = int(os.getenv("EMBED_DIM", "768"))
-        print(f"[EMBED] dim detection failed ({e}), using {fallback}")
+        fallback = int(os.getenv("EMBED_DIM", "2048"))
+        print(f"[EMBED] detection failed: {e} — using {fallback}")
         return fallback
 
 
-# ── Pinecone setup (auto-recreate on dim mismatch) ────────────────────────────
+# ── Pinecone index (auto-recreate on dim mismatch) ────────────────────────────
 
 def _init_index(dim: int):
     existing = {idx["name"] for idx in pc.list_indexes()}
-
     if INDEX_NAME in existing:
         desc = pc.describe_index(INDEX_NAME)
         if desc.dimension != dim:
-            print(f"[PINECONE] dim mismatch: index={desc.dimension} model={dim} → recreating")
+            print(f"[PINECONE] dim mismatch {desc.dimension}→{dim}, recreating…")
             pc.delete_index(INDEX_NAME)
             time.sleep(10)
-            existing = set()
         else:
-            print(f"[PINECONE] connected: {INDEX_NAME} (dim={dim})")
+            print(f"[PINECONE] connected (dim={dim})")
             return pc.Index(INDEX_NAME)
-
-    print(f"[PINECONE] creating: {INDEX_NAME} (dim={dim})")
+    print(f"[PINECONE] creating index (dim={dim})")
     pc.create_index(
         name=INDEX_NAME,
         dimension=dim,
@@ -106,7 +130,7 @@ def _init_index(dim: int):
     return pc.Index(INDEX_NAME)
 
 
-EMBED_DIM = _detect_embed_dim()
+EMBED_DIM = _detect_dim()
 index     = _init_index(EMBED_DIM)
 
 # ── Pydantic models ────────────────────────────────────────────────────────────
@@ -133,7 +157,7 @@ class UploadResponse(BaseModel):
     type: str
     chunks_added: int
 
-# ── Text extraction ────────────────────────────────────────────────────────────
+# ── Text helpers ───────────────────────────────────────────────────────────────
 
 def _extract_text(file: UploadFile) -> str:
     data = file.file.read()
@@ -156,23 +180,21 @@ def _chunk(text: str) -> List[str]:
         start += CHUNK_SIZE - CHUNK_OVERLAP
     return chunks
 
-# ── Embed functions ────────────────────────────────────────────────────────────
+# ── Embed wrappers ─────────────────────────────────────────────────────────────
 
-@retry(stop=stop_after_attempt(3), wait=wait_exponential(min=1, max=10))
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(min=2, max=15))
 def _embed_batch(texts: List[str]) -> List[List[float]]:
-    return _raw_embed(texts)
+    return _ollama_embed(texts)
 
-@retry(stop=stop_after_attempt(3), wait=wait_exponential(min=1, max=10))
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(min=2, max=15))
 def _embed_query(text: str) -> List[float]:
-    return _raw_embed(text)[0]
+    return _ollama_embed(text)[0]
 
-# ── Chat helper (handles SSE streaming + regular JSON) ────────────────────────
+# ── Chat helper ────────────────────────────────────────────────────────────────
 
 def _parse_sse(text: str) -> Dict:
-    """Accumulate SSE chunks into a single OpenAI-format response dict."""
     content_parts  = []
-    tool_calls_map = {}
-
+    tool_calls_map: Dict[int, Dict] = {}
     for line in text.splitlines():
         if not line.startswith("data:"):
             continue
@@ -199,31 +221,27 @@ def _parse_sse(text: str) -> Dict:
                 tool_calls_map[idx]["function"]["arguments"] += fn.get("arguments", "")
         except json.JSONDecodeError:
             pass
-
-    message: Dict = {"role": "assistant", "content": "".join(content_parts)}
+    msg: Dict = {"role": "assistant", "content": "".join(content_parts)}
     if tool_calls_map:
-        message["tool_calls"] = [tool_calls_map[i] for i in sorted(tool_calls_map)]
-
-    return {"choices": [{"message": message}]}
+        msg["tool_calls"] = [tool_calls_map[i] for i in sorted(tool_calls_map)]
+    return {"choices": [{"message": msg}]}
 
 
 def _chat(messages: List[Dict], tools: Optional[List[Dict]] = None) -> Dict:
     payload: Dict = {"model": OLLAMA_MODEL, "messages": messages, "stream": False}
     if tools:
         payload["tools"] = tools
-
     with httpx.Client(timeout=OLLAMA_TIMEOUT) as http:
         r = http.post(
             f"{OLLAMA_BASE_URL}/chat/completions",
             json=payload,
-            headers=_AUTH_HEADERS,
+            headers=_HEADERS,
         )
         if r.status_code != 200:
             print(f"[CHAT] {r.status_code}: {r.text[:300]}")
             r.raise_for_status()
-
         text = r.text.strip()
-        if text.startswith("data:"):      # server ignored stream=False
+        if text.startswith("data:"):
             return _parse_sse(text)
         return json.loads(text)
 
@@ -232,9 +250,7 @@ def _chat(messages: List[Dict], tools: Optional[List[Dict]] = None) -> Dict:
 def _search(doc_type: str, query: str, top_k: int) -> List[Dict]:
     vec = _embed_query(query)
     res = index.query(
-        vector=vec,
-        top_k=top_k,
-        include_metadata=True,
+        vector=vec, top_k=top_k, include_metadata=True,
         filter={"type": {"$eq": doc_type}},
     )
     return [
@@ -248,7 +264,7 @@ def _search(doc_type: str, query: str, top_k: int) -> List[Dict]:
         for m in res["matches"]
     ]
 
-# ── Tool definitions (OpenAI format) ──────────────────────────────────────────
+# ── Tool definitions ───────────────────────────────────────────────────────────
 
 _TOOLS = [
     {
@@ -294,7 +310,7 @@ _TOOL_FN = {
     "search_schemes": lambda q, k: _search("schemes", q, k),
 }
 
-# ── Upload endpoint ────────────────────────────────────────────────────────────
+# ── Upload ─────────────────────────────────────────────────────────────────────
 
 @app.post("/upload", response_model=UploadResponse, tags=["Upload"])
 async def upload(
@@ -303,17 +319,14 @@ async def upload(
 ):
     if type not in ALLOWED_TYPES:
         raise HTTPException(400, f"type must be one of: {', '.join(sorted(ALLOWED_TYPES))}")
-
     text = _extract_text(file)
     if not text.strip():
         raise HTTPException(400, "File is empty or unreadable")
-
     chunks = _chunk(text)
     if not chunks:
         raise HTTPException(400, "No valid chunks extracted")
 
     print(f"[UPLOAD] {file.filename} ({type}): {len(chunks)} chunks")
-
     vectors = []
     for i in range(0, len(chunks), EMBED_BATCH):
         batch      = chunks[i : i + EMBED_BATCH]
@@ -330,8 +343,7 @@ async def upload(
                     "type":        type,
                 },
             })
-        if i + EMBED_BATCH < len(chunks):
-            time.sleep(0.5)
+        time.sleep(0.5)
 
     for i in range(0, len(vectors), UPSERT_BATCH):
         index.upsert(vectors=vectors[i : i + UPSERT_BATCH])
@@ -343,12 +355,11 @@ async def upload(
         chunks_added=len(chunks),
     )
 
-# ── Query endpoint ─────────────────────────────────────────────────────────────
+# ── Query ──────────────────────────────────────────────────────────────────────
 
 @app.post("/query", response_model=QueryResponse, tags=["Query"])
 async def query(request: QueryRequest):
     messages: List[Dict] = [{"role": "user", "content": request.question}]
-
     resp = _chat(messages, tools=_TOOLS)
     msg  = resp["choices"][0]["message"]
 
@@ -360,7 +371,6 @@ async def query(request: QueryRequest):
 
     if tool_calls:
         messages.append(msg)
-
         for tc in tool_calls:
             fn_name = tc["function"]["name"]
             args    = tc["function"]["arguments"]
@@ -368,15 +378,12 @@ async def query(request: QueryRequest):
                 args = json.loads(args)
             top_k  = int(args.get("top_k", request.top_k))
             q_text = args["query"]
-
             if fn_name not in _TOOL_FN:
                 raise HTTPException(500, f"Unknown tool: {fn_name}")
-
             print(f"[TOOL] {fn_name}(query={q_text!r}, top_k={top_k})")
             chunks = _TOOL_FN[fn_name](q_text, top_k)
             all_sources.extend(chunks)
             tools_used.append(fn_name)
-
             messages.append({
                 "role":         "tool",
                 "tool_call_id": tc["id"],
@@ -384,34 +391,27 @@ async def query(request: QueryRequest):
                     "chunks": [{"text": c["text"], "source": c["filename"]} for c in chunks]
                 }),
             })
-
         resp = _chat(messages)
         msg  = resp["choices"][0]["message"]
 
     else:
-        # Fallback: model skipped tools → search directly
-        print("[QUERY] No tool calls — using direct search fallback")
+        # Fallback: model skipped tools — search directly
+        print("[QUERY] no tool calls — direct search fallback")
         for doc_type in ("pests", "schemes"):
             chunks = _search(doc_type, request.question, request.top_k)
             if chunks:
                 all_sources.extend(chunks)
                 tools_used.append(f"search_{doc_type}")
-
         if all_sources:
             context = "\n\n".join(f"[{c['filename']}]: {c['text']}" for c in all_sources)
-            messages = [
-                {"role": "user", "content": (
-                    f"Answer the question using only the context below.\n\n"
-                    f"Context:\n{context}\n\n"
-                    f"Question: {request.question}"
-                )}
-            ]
+            messages = [{"role": "user", "content": (
+                f"Answer using only the context below.\n\nContext:\n{context}\n\nQuestion: {request.question}"
+            )}]
             resp = _chat(messages)
             msg  = resp["choices"][0]["message"]
 
-    answer = msg.get("content") or "No answer could be generated."
     return QueryResponse(
-        answer=answer,
+        answer=msg.get("content") or "No answer could be generated.",
         sources=[SourceChunk(**s) for s in all_sources],
         tools_used=tools_used,
     )
@@ -432,7 +432,6 @@ def health():
     except Exception as e:
         return {"status": "error", "detail": str(e)}
 
-
 @app.get("/stats", tags=["System"])
 def stats():
     s = index.describe_index_stats()
@@ -443,17 +442,15 @@ def stats():
         "index_fullness": s.index_fullness,
     }
 
-
 @app.get("/", tags=["System"])
 def root():
     return {
         "service":   "AgriGPT RAG Service",
-        "version":   "5.0.0",
+        "version":   "5.2.0",
         "model":     OLLAMA_MODEL,
         "embed_dim": EMBED_DIM,
         "docs":      "/docs",
     }
-
 
 if __name__ == "__main__":
     import uvicorn
