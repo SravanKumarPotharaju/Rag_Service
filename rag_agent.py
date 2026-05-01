@@ -133,6 +133,30 @@ def _init_index(dim: int):
 EMBED_DIM    = _detect_dim()
 index        = _init_index(EMBED_DIM)
 _known_types: set = set()
+_REGISTRY_ID = "__types_registry__"
+
+
+def _load_known_types():
+    try:
+        result = index.fetch(ids=[_REGISTRY_ID])
+        vectors = result.get("vectors") or {}
+        if _REGISTRY_ID in vectors:
+            types = vectors[_REGISTRY_ID].get("metadata", {}).get("types", [])
+            _known_types.update(types)
+            print(f"[REGISTRY] loaded types: {_known_types}")
+    except Exception as e:
+        print(f"[REGISTRY] could not load types: {e}")
+
+
+def _save_known_types():
+    index.upsert(vectors=[{
+        "id":     _REGISTRY_ID,
+        "values": [0.0] * EMBED_DIM,
+        "metadata": {"types": list(_known_types), "is_registry": True},
+    }])
+
+
+_load_known_types()
 
 # ── Pydantic models ────────────────────────────────────────────────────────────
 
@@ -324,6 +348,7 @@ async def upload(
         index.upsert(vectors=vectors[i : i + UPSERT_BATCH])
 
     _known_types.add(type)
+    _save_known_types()
 
     return UploadResponse(
         message="Indexed successfully",
