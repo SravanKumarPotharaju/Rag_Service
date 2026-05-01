@@ -130,8 +130,9 @@ def _init_index(dim: int):
     return pc.Index(INDEX_NAME)
 
 
-EMBED_DIM = _detect_dim()
-index     = _init_index(EMBED_DIM)
+EMBED_DIM    = _detect_dim()
+index        = _init_index(EMBED_DIM)
+_known_types: set = set()
 
 # ── Pydantic models ────────────────────────────────────────────────────────────
 
@@ -256,29 +257,31 @@ def _search(doc_type: str, query: str, top_k: int) -> List[Dict]:
 
 # ── Tool definitions ───────────────────────────────────────────────────────────
 
-_TOOLS = [
-    {
-        "type": "function",
-        "function": {
-            "name": "search_agriculture",
-            "description": (
-                "Search the agriculture knowledge base. "
-                "Set type='pests' for questions about crop pests, diseases, symptoms, or treatments. "
-                "Set type='schemes' for questions about government schemes, subsidies, farmer benefits, or financial aid."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "query": {"type": "string", "description": "Search query"},
-                    "type":  {"type": "string", "enum": ["pests", "schemes"],
-                              "description": "Knowledge base to search"},
-                    "top_k": {"type": "integer", "description": "Number of results"},
+def _build_tools() -> List[Dict]:
+    types = sorted(_known_types) if _known_types else ["general"]
+    return [
+        {
+            "type": "function",
+            "function": {
+                "name": "search_agriculture",
+                "description": (
+                    f"Search the agriculture knowledge base. "
+                    f"Available types: {', '.join(types)}. "
+                    f"Pick the type that best matches the question."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string", "description": "Search query"},
+                        "type":  {"type": "string", "enum": types,
+                                  "description": "Knowledge base type to search"},
+                        "top_k": {"type": "integer", "description": "Number of results"},
+                    },
+                    "required": ["query", "type"],
                 },
-                "required": ["query", "type"],
             },
         },
-    },
-]
+    ]
 
 _TOOL_FN = {
     "search_agriculture": lambda q, t, k: _search(t, q, k),
@@ -320,6 +323,8 @@ async def upload(
     for i in range(0, len(vectors), UPSERT_BATCH):
         index.upsert(vectors=vectors[i : i + UPSERT_BATCH])
 
+    _known_types.add(type)
+
     return UploadResponse(
         message="Indexed successfully",
         filename=file.filename,
@@ -332,7 +337,7 @@ async def upload(
 @app.post("/query", response_model=QueryResponse, tags=["Query"])
 async def query(request: QueryRequest):
     messages: List[Dict] = [{"role": "user", "content": request.question}]
-    resp = _chat(messages, tools=_TOOLS)
+    resp = _chat(messages, tools=_build_tools())
     msg  = resp["choices"][0]["message"]
 
     all_sources: List[Dict] = []
@@ -367,24 +372,13 @@ async def query(request: QueryRequest):
             msg  = resp["choices"][0]["message"]
 
     else:
-        # Fallback: model skipped tools — infer type from answer content keywords
-        print("[QUERY] no tool calls — direct search fallback")
-        q = request.question.lower()
-        schemes_kw = {"scheme", "yojana", "kisan", "subsidy", "pension", "insurance",
-                      "pmfby", "rkvy", "enam", "msp", "benefit", "loan", "bima"}
-        doc_types = ["schemes"] if any(k in q for k in schemes_kw) else ["pests"]
-        for doc_type in doc_types:
+        # Fallback: model skipped tools — search across all known types
+        print("[QUERY] no tool calls — searching all known types")
+        for doc_type in _known_types:
             chunks = _search(doc_type, request.question, request.top_k)
             if chunks:
                 all_sources.extend(chunks)
                 tools_used.append(f"search_{doc_type}")
-        if not all_sources:
-            # nothing found in guessed type — try the other
-            other = "pests" if doc_types[0] == "schemes" else "schemes"
-            chunks = _search(other, request.question, request.top_k)
-            all_sources.extend(chunks)
-            if chunks:
-                tools_used.append(f"search_{other}")
         if all_sources:
             context = "\n\n".join(f"[{c['filename']}]: {c['text']}" for c in all_sources)
             synthesis = [{"role": "user", "content": (
