@@ -182,6 +182,11 @@ class UploadResponse(BaseModel):
     type: str
     chunks_added: int
 
+class DeleteResponse(BaseModel):
+    message: str
+    filename: str
+    chunks_deleted: int
+
 # ── Text helpers ───────────────────────────────────────────────────────────────
 
 def _extract_text(file: UploadFile) -> str:
@@ -417,6 +422,39 @@ async def query(request: QueryRequest):
         sources=[SourceChunk(**s) for s in all_sources],
         tools_used=tools_used,
     )
+
+# ── Delete ─────────────────────────────────────────────────────────────────────
+
+@app.delete("/delete/{filename}", response_model=DeleteResponse, tags=["Upload"])
+async def delete_document(filename: str):
+    # List all vector IDs for this filename using prefix match
+    ids_to_delete = []
+    try:
+        for id_batch in index.list(prefix=f"{filename}_"):
+            ids_to_delete.extend(id_batch)
+    except Exception as e:
+        raise HTTPException(500, f"Failed to list vectors: {e}")
+
+    if not ids_to_delete:
+        raise HTTPException(404, f"No indexed chunks found for filename: {filename}")
+
+    # Delete in batches of 1000
+    for i in range(0, len(ids_to_delete), 1000):
+        index.delete(ids=ids_to_delete[i : i + 1000])
+
+    print(f"[DELETE] {filename}: {len(ids_to_delete)} chunks deleted")
+    return DeleteResponse(
+        message="Deleted successfully",
+        filename=filename,
+        chunks_deleted=len(ids_to_delete),
+    )
+
+
+@app.get("/documents", tags=["Upload"])
+def list_documents():
+    """List all indexed document types."""
+    return {"types": sorted(_known_types)}
+
 
 # ── System endpoints ───────────────────────────────────────────────────────────
 
