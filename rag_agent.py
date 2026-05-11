@@ -142,9 +142,10 @@ def _load_known_types():
         result = index.fetch(ids=[_REGISTRY_ID])
         vectors = result.get("vectors") or {}
         if _REGISTRY_ID in vectors:
-            meta  = vectors[_REGISTRY_ID].get("metadata", {})
+            meta = vectors[_REGISTRY_ID].get("metadata", {})
             _known_types.update(meta.get("types", []))
-            _known_files.update(meta.get("files", {}))
+            files_raw = meta.get("files", "{}")
+            _known_files.update(json.loads(files_raw) if isinstance(files_raw, str) else files_raw)
             print(f"[REGISTRY] types={_known_types}  files={list(_known_files.keys())}")
     except Exception as e:
         print(f"[REGISTRY] could not load: {e}")
@@ -156,7 +157,7 @@ def _save_known_types():
         "values": [1e-7] * EMBED_DIM,
         "metadata": {
             "types":       list(_known_types),
-            "files":       _known_files,
+            "files":       json.dumps(_known_files),   # dict → JSON string (Pinecone requires string/number/bool)
             "is_registry": True,
         },
     }])
